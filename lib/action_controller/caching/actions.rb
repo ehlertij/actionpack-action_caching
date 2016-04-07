@@ -110,10 +110,10 @@ module ActionController
           return unless cache_configured?
           options = actions.extract_options!
           options[:layout] = true unless options.key?(:layout)
-          filter_options = options.extract!(:if, :unless).merge(only: actions)
-          cache_options  = options.extract!(:layout, :cache_path).merge(store_options: options)
+          filter_options = options.extract!(:if, :unless)
+          cache_options  = options.extract!(:layout, :cache_path, :http_cache).merge(store_options: options)
 
-          around_filter ActionCacheFilter.new(cache_options), filter_options
+          around_filter ActionCacheFilter.new(filter_options, cache_options), { only: actions }
         end
       end
 
@@ -146,12 +146,18 @@ module ActionController
       end
 
       class ActionCacheFilter # :nodoc:
-        def initialize(options, &block)
-          @cache_path, @store_options, @cache_layout =
-            options.values_at(:cache_path, :store_options, :layout)
+        def initialize(filter_options, options, &block)
+          @cache_path, @store_options, @cache_layout, @http_cache =
+            options.values_at(:cache_path, :store_options, :layout, :http_cache)
+          @if, @unless = filter_options.values_at(:if, :unless)
         end
 
         def around(controller)
+          return unless http_cache_stale?(controller)
+
+          return yield unless @if && controller.instance_exec(controller, &@if)
+          return yield if @unless && controller.instance_exec(controller, &@unless)
+
           cache_layout = @cache_layout.respond_to?(:call) ? @cache_layout.call(controller) : @cache_layout
 
           path_options = if @cache_path.is_a?(Proc)
@@ -163,7 +169,6 @@ module ActionController
           end
 
           cache_path = ActionCachePath.new(controller, path_options || {})
-
           body = controller.read_fragment(cache_path.path, @store_options)
 
           unless body
@@ -177,6 +182,26 @@ module ActionController
 
           controller.response_body = body
           controller.content_type = Mime[cache_path.extension || :html]
+        end
+
+        private
+
+        def http_cache_stale?(controller)
+          http_cache_options = if @http_cache.is_a?(Proc)
+            controller.instance_exec(controller, &@http_cache)
+          elsif @http_cache.is_a?(Hash)
+            return true if @http_cache[:if] && !controller.instance_exec(controller, &@http_cache[:if])
+            return true if @http_cache[:unless] && controller.instance_exec(controller, &@http_cache[:unless])
+
+            {
+              etag: controller.instance_exec(controller, &@http_cache[:etag]),
+              last_modified: controller.instance_exec(controller, &@http_cache[:last_modified]),
+            }
+          else
+            @http_cache
+          end
+
+          !http_cache_options || controller.stale?(http_cache_options)
         end
       end
 
